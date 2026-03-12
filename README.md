@@ -305,4 +305,4 @@ The training script will not run on a single T4 (16 GB) with an 8B model at thes
 
 ## License
 
-MIT — use freely, adapt for your own projects. If you build something with it, feel free to open an issue and share what you made.
+MIT — use freely, adapt for your own projects. If you build something with it, feel free to share what you made. Let's build together!
