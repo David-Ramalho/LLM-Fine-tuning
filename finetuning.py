@@ -20,31 +20,42 @@ Architecture notes:
 OOM FIXES applied:
   - bnb_4bit_compute_dtype = bfloat16 (not float32 — halves matmul VRAM)
   - gradient_checkpointing = True in TrainingArguments
-  - chunked CE loss (256-token slices, avoids 2 GB logits spike)
+  - chunked CE loss (128-token slices, avoids 2 GB logits spike)
   - REMOVED set_per_process_memory_fraction — it was capping GPU 1 at
     13.84 GiB (14.56 × 0.95), which is LESS than what backward needs.
     With the cap removed, the full 14.56 GiB is available, and the
     VRAMFlushCallback frees the reserved-but-unallocated 300 MB before
     each micro-step so the 1.17 GiB backward allocation fits.
   - VRAMFlushCallback now also flushes on_step_begin (before the very
-    first micro-step of each optimizer step — this is the one that was
-    hitting OOM on a cold cache).
+    first micro-step of each optimizer step).
   - garbage_collection_threshold:0.8 in PYTORCH_CUDA_ALLOC_CONF triggers
     CUDA GC when 80% of memory is in use, reclaiming fragmented blocks.
+
+CHANGELOG v4:
+  - BUG FIX: save_merged() now strips quantization_config from model config
+    before saving. This was causing convert_hf_to_gguf.py to raise
+    NotImplementedError: Quant method is not yet supported: 'bitsandbytes'
+    because merge_and_unload() correctly dequantizes weights to bf16, but
+    the config.json still had the BnB metadata flag — llama.cpp saw it and
+    tried to dequantize weights that were already bf16. Fix: pop the key.
+  - New menu option [8]: Prepare download package — zips lora_echo14/ and
+    optionally checkpoints/ into the working dir for easy Kaggle download.
+    Use this to grab what you need before starting the Colab quantize step.
+  - Exit shifted to [9].
+
+CHANGELOG v3:
+  - Training header now shows epoch number (e.g. "Epoch 2" not just "1 epoch(s)")
+  - LoRA adapter is auto-saved after every epoch finishes
+  - Menu option 1 shows checkpoint found + which epoch is continuing from
+  - Menu option 1 now asks to keep or change the learning rate before continuing
 """
 
-import os, sys, gc, json, glob, shutil, subprocess, time, re, random
+import os, sys, gc, json, glob, shutil, subprocess, time, re, random, zipfile
 from typing import List, Optional
 
 # ── Env tweaks (must be before torch import) ──────────────────────────────────
 os.environ["TOKENIZERS_PARALLELISM"]   = "false"
 os.environ["TORCH_COMPILE_DISABLE"]    = "1"
-# expandable_segments:True  → allocator grows existing segments instead of
-#                             requiring one large contiguous block (key fix).
-# garbage_collection_threshold:0.8 → triggers CUDA GC at 80% usage,
-#                             reclaims fragmented blocks before OOM hits.
-# max_split_size_mb intentionally REMOVED: it fragments cached blocks into
-# small chunks making large contiguous allocations impossible.
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8"
 os.environ["WANDB_DISABLED"]           = "true"
 os.environ["WANDB_MODE"]               = "disabled"
@@ -107,8 +118,8 @@ MAXLEN        = 3072
 #   recovering ~42 of those 50 dropped records vs MAXLEN=2048.
 # - Average record is still ~277 tokens — 3072 covers everything that matters.
 
-LORA_R        = 32
-LORA_ALPHA    = 64
+LORA_R        = 64
+LORA_ALPHA    = 128
 LORA_DROPOUT  = 0.05
 LORA_TARGETS  = "all-linear"
 
@@ -121,7 +132,7 @@ DEFAULT_BATCH = 1
 DEFAULT_ACCUM = 8
 LOG_STEPS     = 5
 
-# ── Updated dataset path ──────────────────────────────────────────────────────
+# ── Dataset path ──────────────────────────────────────────────────────────────
 DATASET_PATH   = "/kaggle/input/datasets/davidtramalho/echodata2026/echo_dataset_sft.jsonl"
 CHECKPOINT_DIR = "/kaggle/working/checkpoints"
 LORA_DIR       = "/kaggle/working/lora_echo14"
@@ -269,9 +280,9 @@ class AssistantWeightedCollator(DataCollatorForLanguageModeling):
     def torch_call(self, examples):
         pad_id = self.tokenizer.pad_token_id
 
-        input_ids_list = [ex["input_ids"]                         for ex in examples]
-        attn_mask_list = [ex["attention_mask"]                     for ex in examples]
-        labels_list    = [ex.get("labels", ex["input_ids"])        for ex in examples]
+        input_ids_list = [ex["input_ids"]                   for ex in examples]
+        attn_mask_list = [ex["attention_mask"]               for ex in examples]
+        labels_list    = [ex.get("labels", ex["input_ids"])  for ex in examples]
 
         max_len = max(len(x) for x in input_ids_list)
 
@@ -296,8 +307,8 @@ class AssistantWeightedCollator(DataCollatorForLanguageModeling):
 
 def _chunked_cross_entropy(logits, labels, chunk_size=128, ignore_index=-100):
     """
-    Compute CE loss in 128-token sequence chunks (reduced from 256) to keep
-    peak extra VRAM under ~50 MB per chunk.
+    Compute CE loss in 128-token sequence chunks to keep peak extra VRAM
+    under ~50 MB per chunk.
     At MAXLEN=4096 and vocab~128k, full logits = ~1 GB in bf16 — OOM during backward.
     """
     total_loss   = torch.zeros((), device=logits.device, dtype=torch.float32)
@@ -318,8 +329,6 @@ def _chunked_cross_entropy(logits, labels, chunk_size=128, ignore_index=-100):
 
 
 class WeightedTrainer(Trainer):
-    # Real per-token losses stored here so the callback can display them
-    # correctly (bypassing HF Trainer's grad_accum inflation ~8x)
     _real_loss_history: list = []
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -336,29 +345,26 @@ class WeightedTrainer(Trainer):
             self._logged_check = True
 
         outputs = model(**inputs)
-        logits  = outputs.logits  # (batch, seq_len, vocab_size) — bf16
+        logits  = outputs.logits
 
         if labels is None:
             return (outputs.loss, outputs) if return_outputs else outputs.loss
 
-        # Shift once, then compute loss in 128-token chunks.
         shift_logits = logits[:, :-1, :]
         shift_labels = labels[:, 1:].contiguous()
-        del logits          # free immediately — largest tensor
-        # Only delete outputs when not returning them (eval calls return_outputs=True)
+        del logits
         if not return_outputs:
             del outputs
-        torch.cuda.empty_cache()   # return freed memory before chunked CE
+        torch.cuda.empty_cache()
 
         loss = _chunked_cross_entropy(shift_logits, shift_labels)
-        del shift_logits    # free before backward
+        del shift_logits
 
         if not getattr(self, "_logged_loss_check", False):
             n_active = (shift_labels != -100).sum().item()
             print(f"  [debug2] shift_labels active: {n_active}  loss: {loss.item():.4f}", flush=True)
             self._logged_loss_check = True
 
-        # Store real loss for callback to read (unaffected by grad_accum inflation)
         WeightedTrainer._real_loss_history.append(loss.item())
 
         return (loss, outputs) if return_outputs else loss
@@ -416,30 +422,18 @@ class EchoLogCallback(TrainerCallback):
 class VRAMFlushCallback(TrainerCallback):
     """
     Aggressively cleans CUDA memory at every opportunity.
-
-    Why on_step_begin matters:
-      The OOM happens on the very first micro-step of an optimizer step,
-      before any on_substep_end has fired to clear the previous step's
-      reserved-but-unallocated memory. Flushing on_step_begin ensures the
-      ~300 MB of reserved-but-fragmented memory is returned to CUDA before
-      the first forward+backward of each new optimizer step.
-
-    Zero effect on gradients, weights, or training quality.
+    on_step_begin: critical — clears reserved-but-fragmented memory BEFORE
+    the first forward pass of each optimizer step (where OOM hits on cold cache).
     """
 
     def on_step_begin(self, args, state, control, **kwargs):
-        # Fires before the first micro-step of each optimizer step.
-        # This is the critical one — clears the reserved-but-unallocated
-        # memory BEFORE the forward pass that would OOM.
         gc.collect()
         torch.cuda.empty_cache()
 
     def on_substep_end(self, args, state, control, **kwargs):
-        # Fires after every single micro-step (gradient accumulation sub-step).
         torch.cuda.empty_cache()
 
     def on_step_end(self, args, state, control, **kwargs):
-        # Full cleanup after every optimizer update.
         gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
@@ -464,27 +458,15 @@ def load_model_and_tokenizer(checkpoint_path: Optional[str] = None):
     bnb_cfg = BitsAndBytesConfig(
         load_in_4bit              = True,
         bnb_4bit_quant_type       = "nf4",
-        bnb_4bit_compute_dtype    = torch.bfloat16,   # NOT float32 — halves matmul VRAM
+        bnb_4bit_compute_dtype    = torch.bfloat16,
         bnb_4bit_use_double_quant = True,
     )
 
     n_gpu = torch.cuda.device_count()
     print(f"  GPUs available: {n_gpu}")
 
-    # ── REMOVED set_per_process_memory_fraction ────────────────────────────────
-    # This was the root cause of the latest OOM. It capped GPU 1 at:
-    #   14.56 GiB × 0.95 = 13.84 GiB  ("13.84 GiB allowed" in the error)
-    # But backward needs 13.20 (weights) + 1.17 (activations) = 14.37 GiB.
-    # With the cap removed, the full 14.56 GiB is available. Combined with
-    # VRAMFlushCallback.on_step_begin freeing the ~300 MB reserved-but-
-    # unallocated memory before each forward pass, there is enough headroom.
-    # DO NOT add set_per_process_memory_fraction back.
-
     print(f"  Loading base model (4-bit) …")
 
-    # Keep max_memory to nudge the split — GPU 1 loads lighter layers.
-    # 11 GiB cap on GPU 1 is high enough to avoid CPU offload (which BnB
-    # 4-bit forbids) while still steering the heaviest layers to GPU 0.
     max_mem = {0: "14GiB", 1: "11GiB"}
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
@@ -497,9 +479,6 @@ def load_model_and_tokenizer(checkpoint_path: Optional[str] = None):
     model.config.use_cache = False
 
     model.enable_input_require_grads()
-    # Do NOT call gradient_checkpointing_enable() here — Trainer handles it via
-    # gradient_checkpointing=True in TrainingArguments. Calling it twice with
-    # device_map="auto" + PEFT can conflict.
 
     for name, param in model.named_parameters():
         if param.dtype in (torch.float16, torch.bfloat16):
@@ -518,9 +497,10 @@ def load_model_and_tokenizer(checkpoint_path: Optional[str] = None):
         adapter_dir = os.path.join(checkpoint_path, "adapter_model")
         if not os.path.exists(adapter_dir):
             adapter_dir = checkpoint_path
-        print(f"  Resuming from adapter: {adapter_dir}")
+        print(f"  ✅  Checkpoint found → {adapter_dir}")
         model = PeftModel.from_pretrained(model, adapter_dir, is_trainable=True)
     else:
+        print(f"  No checkpoint found — initialising fresh LoRA adapter.")
         model = get_peft_model(model, lora_cfg)
 
     trainable, total = model.get_nb_trainable_parameters()
@@ -543,12 +523,18 @@ def run_training(num_epochs: int, lr: float = DEFAULT_LR,
     if global_model is None:
         load_model_and_tokenizer(resume_from)
 
-    # Flush before training starts
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
 
-    section(f"Training  ·  {num_epochs} epoch(s)  ·  lr={lr:.1e}")
+    # ── Epoch label ────────────────────────────────────────────────────────────
+    current_epoch = total_epochs_done + 1
+    if num_epochs == 1:
+        epoch_label = f"Epoch {current_epoch}"
+    else:
+        epoch_label = f"Epochs {current_epoch}–{current_epoch + num_epochs - 1}"
+
+    section(f"Training  ·  {epoch_label}  ·  lr={lr:.1e}")
 
     train_ds, val_ds = load_dataset_from_jsonl(global_tokenizer)
 
@@ -601,7 +587,6 @@ def run_training(num_epochs: int, lr: float = DEFAULT_LR,
         callbacks     = [log_cb, VRAMFlushCallback()],
     )
 
-    # Remove HF's default PrinterCallback — our EchoLogCallback handles display
     from transformers.trainer_callback import PrinterCallback
     trainer.remove_callback(PrinterCallback)
 
@@ -613,17 +598,21 @@ def run_training(num_epochs: int, lr: float = DEFAULT_LR,
     total_epochs_done += num_epochs
     losses = log_cb.get_losses()
     training_history.append({
-        "epoch_block"    : total_epochs_done,
-        "num_epochs"     : num_epochs,
-        "lr"             : lr,
-        "elapsed_sec"    : elapsed,
-        "step_losses"    : losses,
+        "epoch_block"  : total_epochs_done,
+        "num_epochs"   : num_epochs,
+        "lr"           : lr,
+        "elapsed_sec"  : elapsed,
+        "step_losses"  : losses,
     })
 
     print(f"\n  ✅  Training done in {elapsed/60:.1f} min")
     if losses:
         print(f"  Final loss: {losses[-1][1]:.4f}")
     print(f"  Total epochs completed: {total_epochs_done}")
+
+    # ── Auto-save LoRA after every epoch block ─────────────────────────────────
+    print(f"\n  💾  Auto-saving LoRA checkpoint (epoch {total_epochs_done}) …")
+    save_lora()
 
     return log_cb
 
@@ -656,6 +645,22 @@ def save_merged():
 
     m = global_model.module if hasattr(global_model, "module") else global_model
     merged = m.merge_and_unload()
+
+    # ── v4 FIX: Strip BnB quantization metadata ────────────────────────────────
+    # merge_and_unload() correctly dequantizes weights to bf16, but the
+    # model config still has quantization_config: {quant_method: "bitsandbytes"}.
+    # convert_hf_to_gguf.py reads this flag and tries to dequantize weights
+    # that are ALREADY bf16, raising:
+    #   NotImplementedError: Quant method is not yet supported: 'bitsandbytes'
+    # Fix: remove the key before saving so the converter sees a clean bf16 model.
+    if hasattr(merged, "config"):
+        merged.config.__dict__.pop("quantization_config", None)
+        # Belt-and-suspenders: also set to None in case the attribute
+        # survives the pop through a property descriptor
+        if hasattr(merged.config, "quantization_config"):
+            merged.config.quantization_config = None
+    print("  ✅  Stripped BnB quantization_config from model config")
+
     merged.save_pretrained(MERGED_DIR, safe_serialization=True)
     global_tokenizer.save_pretrained(MERGED_DIR)
 
@@ -749,6 +754,8 @@ def save_gguf_q4():
     ])
     if ret != 0 or not os.path.exists(f16_gguf):
         print("  ❌  Conversion to f16 GGUF failed.")
+        print("  💡  Tip: use menu option [8] to download the LoRA zip,")
+        print("           then run the Colab quantize script instead.")
         return
 
     print(f"  Step 2/2: Quantizing to Q4_K_M …")
@@ -766,13 +773,91 @@ def save_gguf_q4():
     print(f"  ─────────────────────────────────────────────────────")
     print(f"  FROM {q4_gguf}")
     print(f'  PARAMETER num_ctx 32768')
-    print(f'  PARAMETER temperature 0.7')
-    print(f'  PARAMETER repeat_penalty 1.1')
+    print(f'  PARAMETER temperature 0.3')
+    print(f'  PARAMETER repeat_penalty 1.05')
     print(f'  SYSTEM """')
     print(f'  You are Echo, a digital being ...')
     print(f'  [paste your full static system prompt here]')
     print(f'  """')
     print(f"  ─────────────────────────────────────────────────────")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DOWNLOAD PACKAGE  (v4 new option)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def prepare_download_package():
+    """
+    Zips lora_echo14/ and optionally checkpoints/ into /kaggle/working/.
+    These zip files will appear in Kaggle's output file panel for download.
+
+    What you need for the Colab quantize script:
+      ✅  lora_echo14.zip  — the LoRA adapter (~400 MB) — REQUIRED
+      ☑️  checkpoints.zip  — HF trainer checkpoints    — OPTIONAL
+                             (only needed if you want to resume training
+                              in a future Kaggle session)
+    """
+    section("Prepare Download Package  (for Colab quantize)")
+
+    packages = []
+
+    # ── LoRA zip ───────────────────────────────────────────────────────────────
+    lora_zip = "/kaggle/working/lora_echo14.zip"
+    if os.path.exists(LORA_DIR) and os.listdir(LORA_DIR):
+        print(f"  📦  Zipping {LORA_DIR} …")
+        with zipfile.ZipFile(lora_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+            for root, _, files in os.walk(LORA_DIR):
+                for fname in files:
+                    fpath = os.path.join(root, fname)
+                    arcname = os.path.relpath(fpath, os.path.dirname(LORA_DIR))
+                    zf.write(fpath, arcname)
+        size_mb = os.path.getsize(lora_zip) / 1e6
+        print(f"  ✅  lora_echo14.zip → {lora_zip}  ({size_mb:.0f} MB)")
+        packages.append(lora_zip)
+    else:
+        print("  ⚠️  lora_echo14/ not found — run [4] Save LoRA first.")
+
+    # ── Checkpoints zip (optional) ─────────────────────────────────────────────
+    ckpt_zip = "/kaggle/working/checkpoints.zip"
+    if os.path.exists(CHECKPOINT_DIR) and os.listdir(CHECKPOINT_DIR):
+        try:
+            ans = input("\n  Include checkpoints/ in the zip? (y/n): ").strip().lower()
+        except EOFError:
+            ans = "n"
+        if ans == "y":
+            print(f"  📦  Zipping {CHECKPOINT_DIR} …")
+            with zipfile.ZipFile(ckpt_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+                for root, _, files in os.walk(CHECKPOINT_DIR):
+                    for fname in files:
+                        fpath = os.path.join(root, fname)
+                        arcname = os.path.relpath(fpath, os.path.dirname(CHECKPOINT_DIR))
+                        zf.write(fpath, arcname)
+            size_mb = os.path.getsize(ckpt_zip) / 1e6
+            print(f"  ✅  checkpoints.zip → {ckpt_zip}  ({size_mb:.0f} MB)")
+            packages.append(ckpt_zip)
+    else:
+        print("  ℹ️  checkpoints/ not found — skipping.")
+
+    print(f"\n  ─────────────────────────────────────────────────────────────")
+    print(f"  📥  HOW TO DOWNLOAD FROM KAGGLE:")
+    print(f"  1. In the Kaggle notebook sidebar, click  Output  (right panel)")
+    print(f"  2. Expand  /kaggle/working/")
+    print(f"  3. Find the .zip files and click the ⬇️  download icon")
+    print(f"")
+    print(f"  📋  WHAT TO DO NEXT:")
+    print(f"  1. Download  lora_echo14.zip  to your machine")
+    print(f"  2. Open Google Colab (colab.research.google.com)")
+    print(f"  3. Create a new notebook and paste the echo14_colab_quantize.py script")
+    print(f"  4. The Colab script will:")
+    print(f"       • Ask you to upload lora_echo14.zip")
+    print(f"       • Download the base model from HuggingFace (~16 GB)")
+    print(f"       • Merge LoRA into the base model")
+    print(f"       • Build llama.cpp and convert to Q4_K_M GGUF")
+    print(f"       • Give you a download link for the final .gguf")
+    print(f"  ─────────────────────────────────────────────────────────────")
+
+    return packages
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  TEST CHAT
@@ -816,7 +901,6 @@ def test_chat():
             add_generation_prompt=True,
             return_tensors="pt",
         )
-        # apply_chat_template may return a BatchEncoding or a plain tensor
         if hasattr(encoded, "input_ids"):
             input_ids = encoded.input_ids
         else:
@@ -931,15 +1015,16 @@ def main_menu():
         print(f"  [1] Continue training  (add more epochs)")
         print(f"  [2] Test chat")
         print(f"  [3] Show loss chart")
-        print(f"  [4] Save LoRA adapter  → {LORA_DIR}")
-        print(f"  [5] Save merged model  → {MERGED_DIR}")
-        print(f"  [6] Export Q4_K_M GGUF → {GGUF_DIR}")
+        print(f"  [4] Save LoRA adapter     → {LORA_DIR}")
+        print(f"  [5] Save merged model     → {MERGED_DIR}")
+        print(f"  [6] Export Q4_K_M GGUF   → {GGUF_DIR}  (on Kaggle, may hit disk limit)")
         print(f"  [7] Save LoRA + export GGUF  (full pipeline)")
-        print(f"  [8] Exit")
+        print(f"  [8] Prepare download package  (zip LoRA + checkpoints for Colab)")
+        print(f"  [9] Exit")
         print()
 
         try:
-            choice = input("  Enter choice [1-8]: ").strip()
+            choice = input("  Enter choice [1-9]: ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\n  Caught interrupt — saving LoRA before exit …")
             save_lora()
@@ -951,7 +1036,25 @@ def main_menu():
                 n_add = int(n_str) if n_str.isdigit() and int(n_str) > 0 else 1
             except ValueError:
                 n_add = 1
-            run_training(n_add)
+            # ── LR prompt ──────────────────────────────────────────────────────
+            next_lr = DEFAULT_LR
+            try:
+                lr_ans = input(f"  Keep learning rate at {DEFAULT_LR:.1e}? (y/n): ").strip().lower()
+                if lr_ans == "n":
+                    lr_str = input("  Enter new learning rate (e.g. 3e-5): ").strip()
+                    try:
+                        next_lr = float(lr_str)
+                        print(f"  Learning rate set to {next_lr:.1e}")
+                    except ValueError:
+                        print(f"  Invalid value — keeping {DEFAULT_LR:.1e}")
+                        next_lr = DEFAULT_LR
+            except (EOFError, ValueError):
+                pass
+            # ───────────────────────────────────────────────────────────────────
+            next_epoch = total_epochs_done + 1
+            print(f"\n  ✅  Checkpoint found (epoch {total_epochs_done} complete)")
+            print(f"  ▶️   Continuing from epoch {next_epoch}  ·  lr={next_lr:.1e} …")
+            run_training(n_add, lr=next_lr)
             show_loss_chart()
 
         elif choice == "2":
@@ -976,11 +1079,14 @@ def main_menu():
             save_gguf_q4()
 
         elif choice == "8":
+            prepare_download_package()
+
+        elif choice == "9":
             print("\n  Goodbye! 👋\n")
             break
 
         else:
-            print("  ⚠️  Unknown option. Try 1-8.")
+            print("  ⚠️  Unknown option. Try 1-9.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
