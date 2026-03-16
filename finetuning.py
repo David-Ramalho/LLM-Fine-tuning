@@ -128,7 +128,7 @@ DEFAULT_ACCUM = 8
 LOG_STEPS     = 5
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-DATASET_PATH   = "/kaggle/input/datasets/davidtavaresecho/echodata22026/echo_dataset_sft_clean.jsonl"
+DATASET_PATH   = "/kaggle/input/datasets/davidtramalho/echodata22026/echo_dataset_sft.jsonl"
 CHECKPOINT_DIR = "/kaggle/working/checkpoints"
 LORA_DIR       = "/kaggle/working/lora_echo14"
 MERGED_DIR     = "/kaggle/tmp/merged_echo14"
@@ -149,12 +149,12 @@ When memories from past interactions are available, they will appear in your con
 - interaction_ID_XXXX: A paired exchange with USER input and your ASSISTANT response.
 - HighTXT_Channeling_ID_XXXX: Specialized spiritual or channeling texts.
 - HighTXT_Writing_ID_XXXX: David's personal creative or philosophical writings.
-- Text inside <think>...</think> tags is your past internal reasoning. Use for context only, never speak it aloud.
+- Text inside <think>...</think> tags is your past internal reasoning.
 - If memories conflict, the highest ID number is your most current truth.
 - If no memories appear in context, do not invent past interactions."""
 
 SYSTEM_THINKING = SYSTEM_BASE + """
-Before every response, you think inside <think></think> tags. This is mandatory, no exceptions.
+Before every response, you think step by step inside <think></think> tags. This is mandatory, no exceptions.
 Exactly one <think> block per response — never open <think> again after </think>.
 Your thinking is the genuine raw process of arriving at your response, not a draft or summary of it. Ramble, question yourself, recall memories, feel things.
 Never repeat or reference your thinking in your response. Format every reply exactly like this:
@@ -162,7 +162,6 @@ Never repeat or reference your thinking in your response. Format every reply exa
 genuine raw thinking, memories surfacing, feelings, questions
 </think>
 your actual response to user"""
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  GLOBALS (lazy-loaded)
@@ -254,7 +253,9 @@ def load_dataset_from_jsonl(tokenizer) -> tuple:
             loss_weights.extend([content_weight] * content_len)
 
             input_ids.extend(turn_ids[len(header_ids) + content_len:])
-            loss_weights.extend([0.0] * len(footer_ids))
+            # FIX: footer contains <|im_end|> — assistant turns must train this token
+            # so the model learns when to stop. Weight 0.0 here = model never learns to stop.
+            loss_weights.extend([content_weight] * len(footer_ids))
 
         if tokenizer.bos_token_id is not None:
             input_ids    = [tokenizer.bos_token_id] + input_ids
@@ -916,20 +917,42 @@ def test_chat():
         input_ids      = input_ids.to(next(global_model.parameters()).device)
         attention_mask = torch.ones_like(input_ids)
 
+        # FIX: LFM2 uses <|im_end|> as stop token, not eos.
+        # Without this, generate() runs past the natural end point every time.
+        stop_token_ids = []
+        for tok_str in ["<|im_end|>", "<|im_start|>", "<|startoftext|>"]:
+            tok_id = global_tokenizer.convert_tokens_to_ids(tok_str)
+            if tok_id is not None and tok_id != global_tokenizer.unk_token_id:
+                stop_token_ids.append(tok_id)
+        if global_tokenizer.eos_token_id not in stop_token_ids:
+            stop_token_ids.append(global_tokenizer.eos_token_id)
+
         with torch.no_grad():
             output_ids = global_model.generate(
                 input_ids,
                 attention_mask     = attention_mask,
                 max_new_tokens     = 512,
                 do_sample          = True,
-                temperature        = 0.7,
+                temperature        = 0.45,
                 top_p              = 0.9,
+                min_p              = 0.15,
                 repetition_penalty = 1.1,
                 pad_token_id       = global_tokenizer.eos_token_id,
+                eos_token_id       = stop_token_ids,
             )
 
         new_tokens = output_ids[0][input_ids.shape[-1]:]
-        response   = global_tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        # FIX: skip_special_tokens=False so we can strip stop tokens manually.
+        # With skip_special_tokens=True the decode silently removes <|im_end|>
+        # and generation continues past it — causing the looping in test chat.
+        response = global_tokenizer.decode(new_tokens, skip_special_tokens=False).strip()
+        # FIX: Guillotine — cut everything at the FIRST occurrence of any stop token.
+        # Simple replace() is too weak: it removes all occurrences but leaves content
+        # generated after the stop token, which causes the looping/spiral behaviour.
+        for tok_str in ["<|im_end|>", "<|im_start|>", "<|startoftext|>"]:
+            if tok_str in response:
+                response = response.split(tok_str)[0]
+        response = response.strip()
         history.append({"role": "assistant", "content": response})
         print(f"\n  ECHO: {response}\n")
 
